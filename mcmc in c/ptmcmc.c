@@ -3,16 +3,51 @@
 #include <string.h>
 #include <math.h>
 #include <time.h>
+#include <unistd.h>
+
+#include <omp.h> 
 #define pi 3.14159265359
 
-
+//For returnParams datatype-----------------------------------------------------------
 typedef struct{
-    double **mu, **sigma;
-    double *temps;
-    double *acceptance, *swaps;
-    int size, num_temps;
-}returnParams;
+    char *name;
+    double **parameters;
+    double *temperatures;
+    int *acceptance, *swaps;
+    double (*likelihoodFunc)(double *);
+    int loglikely;
+    int num_parameters, num_temps, jump_scale;
+    int currentIteration;
+}allParams;
 
+allParams allocateMemory(char *name, int num_parameters, int num_temperatures){
+    allParams output;
+
+    output.name=(char*)malloc(30*sizeof(char));
+    
+    strcat(output.name,name);
+
+    //allocate pointer array (First dimension is temperatures)
+    output.parameters=(double**)malloc(num_temperatures*sizeof(double*));
+    output.acceptance=(int*)malloc(num_temperatures*sizeof(int));
+    output.swaps=(int*)malloc(num_temperatures*sizeof(int));
+
+    //allocate double arrays inside pointer array (Second dimension is parameter num)
+    for(int i=0; i<num_temperatures; i++){
+        output.parameters[i]=(double*)malloc(num_parameters*sizeof(double));
+    }
+
+    //allocating temperatures
+    output.temperatures = (double*)malloc(num_temperatures*sizeof(double));
+
+    output.num_parameters=num_parameters;
+    output.num_temps = num_temperatures;
+    output.currentIteration=0;
+
+    return output;
+}
+
+//Helper functions for MCMC----------------------------------------------------------
 
 double boxMuller(void){
     double r1 = (double) rand()/(RAND_MAX);
@@ -20,218 +55,181 @@ double boxMuller(void){
     return sqrt(-2*log(r1))*cos(2.0*pi*r2);
 }
 
-
-double * randGaussian(double mu, double sigma, int arr_size){
-    double* arr = (double*)malloc(arr_size*sizeof(double));
-    for(int i=0;i<arr_size;i++){
-        arr[i]=sigma*boxMuller()+mu;
-    }
-    return arr;
+double randGaussian(double mu, double sigma, int arr_size, int threads){
+    return sigma*boxMuller()+mu;
 }
 
+void writeToFile(allParams * current){
+    //Each chain gets its own file
+    for(int temp=0;temp<current->num_temps;temp++){
+        char fileName[100]={'\0'};
+        strcat(fileName,current->name);
+        char endfile[20];
+        sprintf(endfile,"_%i.txt",temp);
+        strcat(fileName,endfile);
 
-double log_likelyhood(double * data, int data_size, double mu, double sigma){
-    double returnValue = 0;
-    
-    //Faking an incorporation of a prior
-    if(sigma<=0.0){
-        return -INFINITY;
+        FILE *f;
+        f = fopen(fileName,"a");
+        if (f==NULL){
+            printf("File unable to be opened: %s",fileName);
+            exit(EXIT_FAILURE);
+        }
+        char toAppend[1000]={'\0'};
+        for(int i=0;i<current->num_parameters;i++){
+            char numArr[20] = {'\0'};
+            sprintf(numArr,"%f,",current->parameters[temp][i]);
+            strcat(toAppend,numArr);
+        }
+        strcat(toAppend,"\n");
+        fputs(toAppend,f);
+        fclose(f);
     }
-
-    for(int i=0;i<data_size;i++){
-        returnValue -= ((data[i]-mu)*(data[i]-mu))/(2*sigma*sigma);
-    }
-    return ((double) data_size) * -(1)*log(sqrt(2*sigma*sigma)) + returnValue;
 }
 
-returnParams allocateMemory(int N,int num_temps){
-    returnParams output;
+void printCurrentCondition(allParams * current, int max_n){
+    int iter = current->currentIteration;
+    double progress = (double) iter/max_n;
+    printf("--------------------------------");
+    printf("Current progress: %i/%i - %f%%\n",iter,max_n,progress);
 
-    //allocate pointer array (First dimension is Temp)
-    output.mu=(double**)malloc(num_temps*sizeof(double*));
-    output.sigma=(double**)malloc(num_temps*sizeof(double*));
-
-    //allocate double arrays inside pointer array (Second dimension is iteration)
-    for(int i=0; i<num_temps; i++){
-        output.mu[i]=(double*)malloc(N*sizeof(double));
-        output.sigma[i]=(double*)malloc(N*sizeof(double));
+    for(int temp=0;temp<current->num_temps;temp++){
+        double chainAcceptance = (double) current->acceptance[temp]/iter;
+        int swap = current->swaps[temp];
+        printf("For chain %i - acceptance=%f%%, swaps=%i\n",temp,chainAcceptance*100,swap);
     }
 
-    //allocating temps, setting the size (number of iterations), and number of temps
-    output.temps = (double*)malloc(num_temps*sizeof(double));
-    output.acceptance = (double*)malloc(num_temps*sizeof(double));
-    output.swaps = (double*)malloc((num_temps-1)*sizeof(double));
-    output.size = N;
-    output.num_temps = num_temps;
-
-    return output;
 }
 
-returnParams mcmc(double * data, int data_size, double * temps, int num_temps,
-                  int N, double jumpsize, double swapChance){
-    //allocating memory
-    returnParams output = allocateMemory(N,num_temps);
-    
-    //To keep track of acceptance and swapping
-    int accept[num_temps];
-    int swaping[num_temps-1];
+void metropolisJump(allParams * current, int temperature_num){
+    double * paramsToJump = current->parameters[temperature_num];
+    double newParams[current->num_parameters]; 
+    double temperature = current->temperatures[temperature_num];
 
-    //assign initial values
-    for(int j = 0; j<num_temps; j++){
-        //Assign temps
-        output.temps[j]=temps[j];
+    for(int i=0;i<current->num_parameters;i++){
+        newParams[i] = paramsToJump[i] + randGaussian(0,current->jump_scale,1,1);
+    }
 
-        //Set initial values
-        output.mu[j][0]=0;
-        output.sigma[j][0]=0.1;
+    double oldLikely = current->likelihoodFunc(paramsToJump);
+    double newLikely = current->likelihoodFunc(newParams);
+    double hastings,randAlpha;
 
-        //set acceptance to 1
-        accept[j]=1;
-        if(j<num_temps-1){
-            swaping[j]=0;
+    if(current->loglikely==1){
+        oldLikely*=1/(temperature);
+        newLikely*=1/(temperature);
+
+        hastings = newLikely-oldLikely;
+        randAlpha = log((double) rand()/(RAND_MAX));
+    }else{
+        oldLikely = pow(oldLikely,(1/temperature));
+        newLikely = pow(newLikely,(1/temperature));
+
+        hastings = newLikely/oldLikely;
+        randAlpha = (double) rand()/(RAND_MAX);
+    }
+
+    if(hastings>randAlpha){
+        current->acceptance[temperature_num]++;
+        for(int i=0;i<current->num_parameters;i++){
+            current->parameters[temperature_num][i]=newParams[i];
         }
     }
+    writeToFile(current);
+}
 
+void proposeSwaps(allParams * current){
+    for(int temp=0;temp<current->num_temps-1;temp++){
+        double like1= current->likelihoodFunc(current->parameters[temp]);
+        double temp1 = current->temperatures[temp];
+        double like2= current->likelihoodFunc(current->parameters[temp+1]);
+        double temp2 = current->temperatures[temp+1];
+        double hastings, randalpha;
 
-    //Start MCMC----------------------------------
-    //for each iteration...
-    for(int i=1;i<N;i++){
+        if(current->loglikely==1){
+            hastings = temp1*(like2-like1)+temp2*(like1-like2);
+            randalpha = log((double) rand()/(RAND_MAX));
+        }else{
+            hastings = (pow(like1,temp2)*pow(like2,temp1))/(pow(like1,temp1)*pow(like2,temp2));
+            randalpha = (double) rand()/(RAND_MAX);
+        }
 
-        //for each chain...
-        for(int j=0;j<num_temps;j++){
-            
-            //Probability of swaping
-            if(i!=0 && (double) rand()/(RAND_MAX)<swapChance && j!=num_temps-1){
-                
-                //Chance for swapping chains
-                //Getting variables needed (inefficient, but easy to read)
-                double mu1 = output.mu[j][i-1];
-                double mu2 = output.mu[j+1][i-1];
-                double sigma1 = output.sigma[j][i-1];
-                double sigma2 = output.sigma[j+1][i-1];
-                double temp1 = output.temps[j];
-                double temp2 = output.temps[j+1];
-
-                //calculate the swap Hasting's in log
-                double swapHTop = (1.0/temp1)*log_likelyhood(data,data_size,mu2,sigma2)+
-                                  (1.0/temp2)*log_likelyhood(data,data_size,mu1,sigma1);
-                double swapHBot = (1.0/temp2)*log_likelyhood(data,data_size,mu2,sigma2)+
-                                  (1.0/temp1)*log_likelyhood(data,data_size,mu1,sigma1);
-                double swapLogH = swapHTop-swapHBot;
-
-                if(swapLogH>0 || swapLogH>= log((double)rand()/RAND_MAX)){
-
-                    //accept the swap
-                    //cold chain gets hot chain numbers
-                    output.mu[j][i] = mu2;
-                    output.sigma[j][i] = sigma2;
-
-                    //hot chain gets cold chain numbers
-                    output.mu[j+1][i] = mu1;
-                    output.sigma[j+1][i]= sigma1;
-
-                    swaping[j]++;
-
-                }else{
-
-                    //Not sure if I need to put anything here
-
-                }
-            }else{
-
-                //Metropolis-Hastings
-                //Get 2 random gaussian numbers for the parameters
-                double * rando = randGaussian(0,jumpsize,2);
-                double newMu = output.mu[j][i-1] + rando[0];
-                double newSigma = output.sigma[j][i-1] + rando[1];
-                
-                //Free up memory allocated to rando
-                free(rando);
-
-                //calculate the hastings ratio with temperature scaling
-                double oldLikely = (1.0/output.temps[j])*log_likelyhood(data, data_size, output.mu[j][i-1],output.sigma[j][i-1]);
-                double newLikely = (1.0/output.temps[j])*log_likelyhood(data, data_size, newMu, newSigma);
-                double logH = newLikely-oldLikely;
-                
-                if(logH>0 || logH>= log((double)rand()/RAND_MAX)){
-                    
-                    //accept the jump
-                    output.mu[j][i] = newMu;
-                    output.sigma[j][i] = newSigma;
-                    accept[j]++;
-                
-                }else{
-                    
-                    //Not accepting the jump
-                    output.mu[j][i]=output.mu[j][i-1];
-                    output.sigma[j][i]=output.sigma[j][i-1];
-
-                }
-
+        if(hastings>randalpha){
+            current->swaps[temp]++;
+            for(int i=0; i<current->num_parameters;i++){
+                double toSwap = current->parameters[temp][i];
+                current->parameters[temp][i] = current->parameters[temp+1][i];
+                current->parameters[temp+1][i] = toSwap;
             }
+        }
+    }
+    writeToFile(current);
+}
 
+allParams mcmc(char *name, int num_params, int num_temps, double *tempArr, double (*likelihoodFunc)(double*),
+                 int loglikely, double jumpscale, int num_steps, int threads){
+    
+    //setting up the parameter structure
+    allParams out = allocateMemory(name,num_params,num_temps);
+    
+    for(int i=0;i<num_temps;i++){
+        out.temperatures[i]=tempArr[i];
+    }
 
+    out.likelihoodFunc = likelihoodFunc;
+    out.loglikely = loglikely;
+    out.jump_scale = jumpscale;
+
+    for(int i=0;i<num_temps;i++){
+        out.acceptance[i]=0;
+        out.swaps[i]=0;
+        for(int j=0;j<num_params;j++){
+            out.parameters[i][j] = (double) rand()/(RAND_MAX);
         }
     }
 
-    //Saving the swapping percentages and acceptance percentages
-    for(int j=0; j<num_temps-1; j++){
-        output.acceptance[j] = (double) accept[j]/N;
-        output.swaps[j] = (double) swaping[j]/N;
+    for(int outer=0;outer<num_steps;outer+=100){
+        
+        //loop over chains
+        //#pragma omp parallel num_threads(threads);
+        for(int temp=0;temp<num_temps;temp++){
+            //99 iterations of metropolis
+            for(int i=outer;(i%100)<99;i++){
+                metropolisJump(&out,temp);
+                out.currentIteration++;
+            }
+        }
+
+        proposeSwaps(&out);
+        out.currentIteration++;
+        printCurrentCondition(&out,num_steps);
     }
 
-    //Since there is one less chain pairs than chains....
-    //(i.e with 3 chains, there is two pairs, 1&2 and 2&3)
-    output.acceptance[num_temps-1]=(double) accept[num_temps-1]/N;
-
-    return output;
+    return out;
 }
 
+double gaussianFunc(double *in){
+    double x = in[0];
+    double sigma = 1;
+    double mu = 1;
+    return (1.0/(sqrt(2.0*pi)*sigma))*exp(-pow(x-mu,2)/(2*pow(sigma,2)));
+}
 
-int main(){
-    //random number generator
-    srand(time(0));
-    
-    printf("Generating gaussian.\n");
-    int data_size = 10000;
-    double * data = randGaussian(1.0,0.6,data_size);
+int main(int argc, char* argv[]){
+
     /*
-    double * data2 = randGaussian(6.0,0.1,data_size);
-
-    for(int i=0; i<data_size; i+=2){
-        data[i] = data2[i]; 
-    }
+    int threads;
+    printf("How many threads to run: ");
+    scanf("%d",&threads);
+    printf("Running with %i threads.\n",threads);
     */
 
-    printf("Finished generating gaussian.\n");
+    //random number generator
+    srand(time(0));
 
-    double temps[] = {1.0,1.5,2.0,2.5,3.0,3.5};
-    int num_temps = 6;
+    double temperature[] = {1.0,1.2,1.4,1.6,1.8};
+    mcmc("Testing",1,1,temperature,&gaussianFunc,0,0.99,1000,1);
 
-    printf("Starting MCMC.\n");
-    returnParams out = mcmc(data,data_size,temps,num_temps,5000,.004,0.0);
-    printf("Finished MCMC.\n");
-    
-    for(int i =0; i<num_temps;i++){
-        printf("Acceptance of chain %i: %f\n",i,out.acceptance[i]);
-    }
-    
 
-    FILE *f;
-    f = fopen("gaussian.txt","w");
-    for(int i=0;i<data_size;i++){
-        fprintf(f,"%f\n",data[i]);
-    }
-    fclose(f);
 
-    
-    FILE *f1;
-    f1 = fopen("mcmc_out.txt","w");
-    for(int i=0;i<out.size;i++){
-        fprintf(f1,"%f\t%f\n",out.mu[0][i],out.sigma[0][i]);
-    }
-    fclose(f1);
-    
     return 0;
     
 }
