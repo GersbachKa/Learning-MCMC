@@ -252,15 +252,15 @@ int main(int argc, char* argv[]){
     double temperature[] = {1.0,1.2,1.4,1.6,1.8};
     
     //One parameter
-    allParams a = mcmc("gaussianOneParam",1,0,0,3,temperature,&gaussianOneParam,0,0.8,5000,1);
+    allParams a = mcmc("gaussianOneParam",1,0,0,1,temperature,&gaussianOneParam,0,0.8,10000,1);
     freeAllParams(&a);
 
     //Two parameters
     double dataArr[1000];
     for(int i=0;i<1000;i++){ 
-        dataArr[i] = randGaussian(1,1);
+        dataArr[i] = randGaussian(.5,1);
     }
-    a = mcmc("gaussianTwoParam",2,dataArr,1000,3,temperature,&gaussianTwoParam,1,.002,1000,1);
+    a = mcmc("gaussianTwoParam",2,dataArr,1000,1,temperature,&gaussianTwoParam,1,.01,10000,1);
     freeAllParams(&a);
 
 
