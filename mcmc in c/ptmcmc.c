@@ -14,9 +14,10 @@ typedef struct{
     double **parameters;
     double *temperatures;
     int *acceptance, *swaps;
-    double (*likelihoodFunc)(double *);
+    double (*likelihoodFunc)(double *, double *, int);
     int loglikely;
-    int num_parameters, num_temps, jump_scale;
+    int num_parameters, num_temps;
+    double jump_scale;
     int currentIteration;
 }allParams;
 
@@ -47,6 +48,17 @@ allParams allocateMemory(char *name, int num_parameters, int num_temperatures){
     return output;
 }
 
+void freeAllParams(allParams * toFree){
+    free(toFree->name);
+    for(int i=0;i<toFree->num_temps;i++){
+       free(toFree->parameters[i]); 
+    }
+    free(toFree->parameters);
+    free(toFree->acceptance);
+    free(toFree->swaps);
+    free(toFree->temperatures);
+}
+
 //Helper functions for MCMC----------------------------------------------------------
 
 double boxMuller(void){
@@ -55,7 +67,7 @@ double boxMuller(void){
     return sqrt(-2*log(r1))*cos(2.0*pi*r2);
 }
 
-double randGaussian(double mu, double sigma, int arr_size, int threads){
+double randGaussian(double mu, double sigma){
     return sigma*boxMuller()+mu;
 }
 
@@ -90,7 +102,7 @@ void printCurrentCondition(allParams * current, int max_n){
     int iter = current->currentIteration;
     double progress = (double) iter/max_n;
     printf("--------------------------------");
-    printf("Current progress: %i/%i - %f%%\n",iter,max_n,progress);
+    printf("Current progress: %i/%i - %i%%\n",iter,max_n,(int)(progress*100));
 
     for(int temp=0;temp<current->num_temps;temp++){
         double chainAcceptance = (double) current->acceptance[temp]/iter;
@@ -100,17 +112,18 @@ void printCurrentCondition(allParams * current, int max_n){
 
 }
 
-void metropolisJump(allParams * current, int temperature_num){
+void metropolisJump(allParams * current, double * data, int datasize, int temperature_num){
     double * paramsToJump = current->parameters[temperature_num];
     double newParams[current->num_parameters]; 
     double temperature = current->temperatures[temperature_num];
 
     for(int i=0;i<current->num_parameters;i++){
-        newParams[i] = paramsToJump[i] + randGaussian(0,current->jump_scale,1,1);
+        newParams[i] = paramsToJump[i];
+        newParams[i] += randGaussian(0,current->jump_scale);
     }
 
-    double oldLikely = current->likelihoodFunc(paramsToJump);
-    double newLikely = current->likelihoodFunc(newParams);
+    double oldLikely = current->likelihoodFunc(paramsToJump,data,datasize);
+    double newLikely = current->likelihoodFunc(newParams,data,datasize);
     double hastings,randAlpha;
 
     if(current->loglikely==1){
@@ -136,11 +149,11 @@ void metropolisJump(allParams * current, int temperature_num){
     writeToFile(current);
 }
 
-void proposeSwaps(allParams * current){
+void proposeSwaps(allParams * current, double * data, int datasize){
     for(int temp=0;temp<current->num_temps-1;temp++){
-        double like1= current->likelihoodFunc(current->parameters[temp]);
+        double like1= current->likelihoodFunc(current->parameters[temp],data,datasize);
         double temp1 = current->temperatures[temp];
-        double like2= current->likelihoodFunc(current->parameters[temp+1]);
+        double like2= current->likelihoodFunc(current->parameters[temp+1],data,datasize);
         double temp2 = current->temperatures[temp+1];
         double hastings, randalpha;
 
@@ -164,8 +177,8 @@ void proposeSwaps(allParams * current){
     writeToFile(current);
 }
 
-allParams mcmc(char *name, int num_params, int num_temps, double *tempArr, double (*likelihoodFunc)(double*),
-                 int loglikely, double jumpscale, int num_steps, int threads){
+allParams mcmc(char *name, int num_params, double *data, int datasize, int num_temps, double *tempArr, 
+               double (*likelihoodFunc)(double*,double*,int), int loglikely, double jumpscale, int num_steps, int threads){
     
     //setting up the parameter structure
     allParams out = allocateMemory(name,num_params,num_temps);
@@ -193,24 +206,36 @@ allParams mcmc(char *name, int num_params, int num_temps, double *tempArr, doubl
         for(int temp=0;temp<num_temps;temp++){
             //99 iterations of metropolis
             for(int i=outer;(i%100)<99;i++){
-                metropolisJump(&out,temp);
-                out.currentIteration++;
+                metropolisJump(&out,data,datasize,temp);
             }
         }
 
-        proposeSwaps(&out);
-        out.currentIteration++;
+        proposeSwaps(&out,data,datasize);
+        out.currentIteration+=100;
         printCurrentCondition(&out,num_steps);
     }
 
     return out;
 }
 
-double gaussianFunc(double *in){
-    double x = in[0];
+double gaussianOneParam(double *params, double *data, int datasize){
+    double x = params[0];
     double sigma = 1;
     double mu = 1;
     return (1.0/(sqrt(2.0*pi)*sigma))*exp(-pow(x-mu,2)/(2*pow(sigma,2)));
+}
+
+double gaussianTwoParam(double *params, double *data, int datasize){
+    double mu = params[0];
+    double sigma = params[1];
+
+    double returnValue = 0;
+
+    for(int i=0;i<datasize;i++){
+        returnValue -= ((data[i]-mu)*(data[i]-mu))/(2*sigma*sigma);
+    }
+    return ((double) datasize) * -(1)*log(sqrt(2*sigma*sigma)) + returnValue;
+
 }
 
 int main(int argc, char* argv[]){
@@ -224,10 +249,19 @@ int main(int argc, char* argv[]){
 
     //random number generator
     srand(time(0));
-
     double temperature[] = {1.0,1.2,1.4,1.6,1.8};
-    mcmc("Testing",1,1,temperature,&gaussianFunc,0,0.99,1000,1);
+    
+    //One parameter
+    allParams a = mcmc("gaussianOneParam",1,0,0,3,temperature,&gaussianOneParam,0,0.8,5000,1);
+    freeAllParams(&a);
 
+    //Two parameters
+    double dataArr[1000];
+    for(int i=0;i<1000;i++){ 
+        dataArr[i] = randGaussian(1,1);
+    }
+    a = mcmc("gaussianTwoParam",2,dataArr,1000,3,temperature,&gaussianTwoParam,1,.002,1000,1);
+    freeAllParams(&a);
 
 
     return 0;
