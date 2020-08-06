@@ -101,7 +101,7 @@ void writeToFile(allParams * current){
 void printCurrentCondition(allParams * current, int max_n){
     int iter = current->currentIteration;
     double progress = (double) iter/max_n;
-    printf("--------------------------------");
+    printf("-------------------------------\n");
     printf("Current progress: %i/%i - %i%%\n",iter,max_n,(int)(progress*100));
 
     for(int temp=0;temp<current->num_temps;temp++){
@@ -202,7 +202,7 @@ allParams mcmc(char *name, int num_params, double *data, int datasize, int num_t
     for(int outer=0;outer<num_steps;outer+=100){
         
         //loop over chains
-        //#pragma omp parallel num_threads(threads);
+        #pragma omp parallel num_threads(threads)
         for(int temp=0;temp<num_temps;temp++){
             //99 iterations of metropolis
             for(int i=outer;(i%100)<99;i++){
@@ -238,18 +238,24 @@ double gaussianTwoParam(double *params, double *data, int datasize){
 
 }
 
-int main(int argc, char* argv[]){
+double multiModal(double *params, double *data, int datasize){
+    double x = params[0];
+    double y = params[1];
+    double ret = (16.0/3.0*pi);
+    ret*=exp(-(x*x)-pow((9+4*x*x+8*y),2));
+    ret*=0.5*exp(-8*x*x-8*pow((y-2),2));
+    return ret;
+}
 
-    /*
+int main(int argc, char* argv[]){
     int threads;
     printf("How many threads to run: ");
     scanf("%d",&threads);
     printf("Running with %i threads.\n",threads);
-    */
 
     //random number generator
     srand(time(0));
-    double temperature[] = {1.0,1.2,1.4,1.6,1.8};
+    double temperature[] = {1.0,1.5,2.0,2.5,3.0};
     
     //One parameter
     allParams a = mcmc("gaussianOneParam",1,0,0,1,temperature,&gaussianOneParam,0,0.8,10000,1);
@@ -262,6 +268,12 @@ int main(int argc, char* argv[]){
     }
     a = mcmc("gaussianTwoParam",2,dataArr,1000,1,temperature,&gaussianTwoParam,1,.01,10000,1);
     freeAllParams(&a);
+
+    double t = omp_get_wtime();
+    a = mcmc("multiModal",2,0,1,5,temperature,&multiModal,0,0.03,50000,threads);
+    freeAllParams(&a);
+    t = omp_get_wtime()-t; 
+    printf("Total Time taken with %i threads: %fs\n",threads,t);
 
 
     return 0;
