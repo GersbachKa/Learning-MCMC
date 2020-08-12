@@ -71,31 +71,29 @@ double randGaussian(double mu, double sigma){
     return sigma*boxMuller()+mu;
 }
 
-void writeToFile(allParams * current){
+void writeToFile(allParams * current, int temp){
     //Each chain gets its own file
-    for(int temp=0;temp<current->num_temps;temp++){
-        char fileName[100]={'\0'};
-        strcat(fileName,current->name);
-        char endfile[20];
-        sprintf(endfile,"_%i.txt",temp);
-        strcat(fileName,endfile);
+    char fileName[100]={'\0'};
+    strcat(fileName,current->name);
+    char endfile[20];
+    sprintf(endfile,"_%i.txt",temp);
+    strcat(fileName,endfile);
 
-        FILE *f;
-        f = fopen(fileName,"a");
-        if (f==NULL){
-            printf("File unable to be opened: %s",fileName);
-            exit(EXIT_FAILURE);
-        }
-        char toAppend[1000]={'\0'};
-        for(int i=0;i<current->num_parameters;i++){
-            char numArr[20] = {'\0'};
-            sprintf(numArr,"%f,",current->parameters[temp][i]);
-            strcat(toAppend,numArr);
-        }
-        strcat(toAppend,"\n");
-        fputs(toAppend,f);
-        fclose(f);
+    FILE *f;
+    f = fopen(fileName,"a");
+    if (f==NULL){
+        printf("File unable to be opened: %s",fileName);
+        exit(EXIT_FAILURE);
     }
+    char toAppend[1000]={'\0'};
+    for(int i=0;i<current->num_parameters;i++){
+        char numArr[20] = {'\0'};
+        sprintf(numArr,"%f,",current->parameters[temp][i]);
+        strcat(toAppend,numArr);
+    }
+    strcat(toAppend,"\n");
+    fputs(toAppend,f);
+    fclose(f);
 }
 
 void printCurrentCondition(allParams * current, int max_n){
@@ -146,7 +144,6 @@ void metropolisJump(allParams * current, double * data, int datasize, int temper
             current->parameters[temperature_num][i]=newParams[i];
         }
     }
-    writeToFile(current);
 }
 
 void proposeSwaps(allParams * current, double * data, int datasize){
@@ -174,11 +171,10 @@ void proposeSwaps(allParams * current, double * data, int datasize){
             }
         }
     }
-    writeToFile(current);
 }
 
 allParams mcmc(char *name, int num_params, double *data, int datasize, int num_temps, double *tempArr, 
-               double (*likelihoodFunc)(double*,double*,int), int loglikely, double jumpscale, int num_steps, int threads){
+               double (*likelihoodFunc)(double*,double*,int), int loglikely, double jumpscale, int num_steps, int threads, int printProgress){
     
     //setting up the parameter structure
     allParams out = allocateMemory(name,num_params,num_temps);
@@ -199,24 +195,42 @@ allParams mcmc(char *name, int num_params, double *data, int datasize, int num_t
         }
     }
 
-    for(int outer=0;outer<num_steps;outer+=100){
-        
-        //loop over chains
-        #pragma omp parallel num_threads(threads)
-        for(int temp=0;temp<num_temps;temp++){
-            //99 iterations of metropolis
-            for(int i=outer;(i%100)<99;i++){
-                metropolisJump(&out,data,datasize,temp);
-            }
+    int totalThreads;
+    #pragma omp parallel num_threads(threads)
+    {
+        int threadNum = omp_get_thread_num();
+        if(threadNum==0){
+            totalThreads=omp_get_num_threads();
         }
 
-        proposeSwaps(&out,data,datasize);
-        out.currentIteration+=100;
-        printCurrentCondition(&out,num_steps);
-    }
+        for(int outer=0;outer<num_steps;outer+=100){
+            for(int temp=threadNum;temp<num_temps;temp+=totalThreads){
+                //99 iterations of metropolis
+                for(int i=outer;(i%100)<99;i++){
+                    metropolisJump(&out,data,datasize,temp);
+                    writeToFile(&out,temp);
+                }
+            }
+            
+            #pragma omp barrier
+            if(threadNum==0){
+                proposeSwaps(&out,data,datasize);
+                out.currentIteration+=100;
+                if(printProgress==1){
+                    printCurrentCondition(&out,num_steps);
+                }
+            }
 
+            #pragma omp barrier
+            for(int temp=threadNum;temp<num_temps;temp+=totalThreads){
+                writeToFile(&out,temp);
+            }
+        }   
+    }
     return out;
 }
+
+
 
 double gaussianOneParam(double *params, double *data, int datasize){
     double x = params[0];
@@ -253,24 +267,36 @@ int main(int argc, char* argv[]){
     scanf("%d",&threads);
     printf("Running with %i threads.\n",threads);
 
+    char response;
+    int printProgress=1;
+    printf("Print progress? (y/n): ");
+    scanf(" %c",&response);
+    if (response == 'N' || response == 'n'){
+        printProgress=0;
+        printf("Not printing to file\n");
+    }
+
     //random number generator
     srand(time(0));
-    double temperature[] = {1.0,1.5,2.0,2.5,3.0};
+    double temperature[] = {1.0,1.5,2.0,2.5,3.0,3.5};
     
     //One parameter
-    allParams a = mcmc("gaussianOneParam",1,0,0,1,temperature,&gaussianOneParam,0,0.8,10000,1);
+    allParams a = mcmc("gaussianOneParam",1,0,0,1,temperature,&gaussianOneParam,0,0.8,10000,1,printProgress);
     freeAllParams(&a);
 
     //Two parameters
-    double dataArr[1000];
-    for(int i=0;i<1000;i++){ 
+    double dataArr[10000];
+    for(int i=0;i<10000;i++){ 
         dataArr[i] = randGaussian(.5,1);
     }
-    a = mcmc("gaussianTwoParam",2,dataArr,1000,1,temperature,&gaussianTwoParam,1,.01,10000,1);
-    freeAllParams(&a);
-
     double t = omp_get_wtime();
-    a = mcmc("multiModal",2,0,1,5,temperature,&multiModal,0,0.03,50000,threads);
+    a = mcmc("gaussianTwoParam",2,dataArr,1000,6,temperature,&gaussianTwoParam,1,.01,10000,threads,printProgress);
+    freeAllParams(&a);
+    t = omp_get_wtime()-t; 
+    printf("Total Time taken with %i threads: %fs\n",threads,t);
+
+    t = omp_get_wtime();
+    a = mcmc("multiModal",2,0,1,6,temperature,&multiModal,0,0.03,50000,threads,printProgress);
     freeAllParams(&a);
     t = omp_get_wtime()-t; 
     printf("Total Time taken with %i threads: %fs\n",threads,t);
